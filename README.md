@@ -6,7 +6,7 @@ so you never miss relevant work. Built because keeping up with fast-moving field
 (single-cell genomics, ML-for-bio) by hand is impossible.
 
 <!-- After you deploy, paste your live link here 👇 -->
-**Live demo:** _coming soon_ · **Tech:** React · FastAPI · Python
+**Live demo:** [research-radar-gold.vercel.app](https://research-radar-gold.vercel.app/) · **Tech:** React · FastAPI · Python
 
 ![Research Radar — ranked papers from bioRxiv, arXiv, and PubMed](docs/screenshots/app.png)
 
