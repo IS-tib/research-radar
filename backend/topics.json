@@ -1,0 +1,26 @@
+{
+  "Single-cell foundation models": {
+    "weight": 4,
+    "terms": ["scGPT", "Geneformer", "scFoundation", "single-cell foundation model", "cell foundation model", "scBERT"]
+  },
+  "Single-cell RNA-seq": {
+    "weight": 3,
+    "terms": ["single-cell RNA", "scRNA-seq", "single cell transcriptom", "cell type annotation", "cell-type annotation", "batch integration", "batch correction", "scANVI"]
+  },
+  "Computational neuroscience": {
+    "weight": 3,
+    "terms": ["neuronal morphology", "connectomics", "neural circuit", "zebrafish", "brain atlas", "neural dynamics"]
+  },
+  "Glioma / brain tumor": {
+    "weight": 3,
+    "terms": ["glioma", "glioblastoma", "brain tumor", "tumor subtype", "WHO grade", "IDH mutation"]
+  },
+  "ML methods (transformers / DL)": {
+    "weight": 2,
+    "terms": ["transformer", "attention mechanism", "foundation model", "representation learning", "self-supervised", "contrastive learning"]
+  },
+  "Clinical NLP / EHR": {
+    "weight": 2,
+    "terms": ["clinical notes", "electronic health record", "MIMIC", "clinical NLP", "ICU", "mortality prediction"]
+  }
+}
