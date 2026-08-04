@@ -18,6 +18,7 @@ import re
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 
 UA = {"User-Agent": "ResearchRadar/2.0 (personal research tool)"}
 
@@ -172,8 +173,21 @@ def scan(topics, days=7, top=20):
         {"generated": "...", "days": 7, "count": N, "papers": [ {...}, ... ]}
     Each paper gets a "_score" and "why" (matched topic names).
     """
-    papers = fetch_biorxiv(days) + fetch_arxiv(days) + fetch_pubmed(
-        days, " OR ".join(f'"{t}"' for cfg in topics.values() for t in cfg["terms"]))
+    pubmed_query = " OR ".join(
+        f'"{t}"' for cfg in topics.values() for t in cfg["terms"])
+
+    # Fetch all three sources CONCURRENTLY instead of one-after-another.
+    # Each fetch is I/O-bound (it just waits on the network), so running them in
+    # separate threads means total time ≈ the slowest single source, not the sum
+    # of all three. ThreadPoolExecutor (Python stdlib) handles the threads for us:
+    # .submit() starts a task immediately and returns a "future"; .result() blocks
+    # until that task finishes and hands back its return value.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_biorxiv = pool.submit(fetch_biorxiv, days)
+        f_arxiv = pool.submit(fetch_arxiv, days)
+        f_pubmed = pool.submit(fetch_pubmed, days, pubmed_query)
+        papers = f_biorxiv.result() + f_arxiv.result() + f_pubmed.result()
+
     papers = dedupe(papers)
 
     for p in papers:
