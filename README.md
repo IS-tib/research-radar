@@ -75,8 +75,7 @@ cd backend && pytest
 
 ## Deploying
 
-See **[DEPLOY.md](DEPLOY.md)** for a step-by-step, beginner-friendly guide to
-putting this on the real internet with a public URL (free).
+Deployed on Vercel (frontend) and Render (backend), which host the two halves independently.
 
 ## Roadmap
 
