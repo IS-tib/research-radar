@@ -1,16 +1,6 @@
-"""
-radar.py — the "brain" of Research Radar.
-
-This module has NO web-server code in it on purpose. It just knows how to:
-  1. fetch recent papers from bioRxiv, arXiv, and PubMed
-  2. score each paper against a set of topics
-  3. return plain Python dicts/lists
-
-Keeping this separate from the web server (main.py) is a real software-design
-habit: the "business logic" doesn't care whether it's called by a command-line
-script, a web API, or a scheduled job. main.py is just a thin wrapper that
-exposes these functions over HTTP.
-"""
+"""Core logic for Research Radar: fetch recent papers from bioRxiv, arXiv, and
+PubMed, then rank them against a set of weighted topics. No web-server code lives
+here so the same functions can back the API, a CLI, or a scheduled job."""
 
 import datetime as dt
 import json
@@ -20,7 +10,11 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
-UA = {"User-Agent": "ResearchRadar/2.0 (personal research tool)"}
+UA = {"User-Agent": "ResearchRadar/2.1"}
+
+# Papers newer than this get a relevance boost; older ones decay to none.
+RECENCY_HALFLIFE_DAYS = 14
+RECENCY_WEIGHT = 0.4
 
 
 def _get(url, timeout=30):
@@ -29,30 +23,47 @@ def _get(url, timeout=30):
         return r.read().decode("utf-8", "replace")
 
 
-# --------------------------- scoring ---------------------------------------
+def _parse_date(s):
+    """Best-effort parse of the differing date formats the three sources use."""
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y-%b-%d", "%Y-%b", "%Y"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+# --- ranking ---------------------------------------------------------------
 
 def score(text, topics):
-    """Return (total_score, [matched topic names]) for a blob of text."""
+    """Weighted keyword score for a blob of text; also returns matched topics."""
     t = text.lower()
     total, hits = 0, []
     for name, cfg in topics.items():
         weight = cfg.get("weight", 1)
         matched = False
         for term in cfg["terms"]:
-            # match the term as a whole word, tolerating a plural suffix
-            # ("glioma" -> "gliomas", "transformer" -> "transformers") but not
-            # random substrings ("MIMIC" won't match "mimicking").
+            # whole-word match, tolerant of a plural suffix but not substrings
+            # (so "glioma" hits "gliomas" but "MIMIC" won't hit "mimicking").
             pat = r"(?<![a-z0-9])" + re.escape(term.lower()) + r"(?:e?s)?(?![a-z0-9])"
-            n = len(re.findall(pat, t))
-            if n:
-                total += weight * n
+            if re.search(pat, t):
+                total += weight * len(re.findall(pat, t))
                 matched = True
         if matched:
             hits.append(name)
     return total, hits
 
 
-# --------------------------- sources ---------------------------------------
+def _recency_factor(date, today):
+    """1.0 for a paper from today, decaying exponentially with age."""
+    if date is None:
+        return 0.0
+    age = max(0, (today - date).days)
+    return 0.5 ** (age / RECENCY_HALFLIFE_DAYS)
+
+
+# --- sources ---------------------------------------------------------------
 
 def fetch_biorxiv(days):
     end = dt.date.today()
@@ -155,7 +166,7 @@ def fetch_pubmed(days, query):
     return out
 
 
-# --------------------------- orchestration ---------------------------------
+# --- orchestration ---------------------------------------------------------
 
 def dedupe(papers):
     seen, out = set(), []
@@ -168,38 +179,42 @@ def dedupe(papers):
 
 
 def scan(topics, days=7, top=20):
-    """
-    The one function the web server calls. Returns a dict:
-        {"generated": "...", "days": 7, "count": N, "papers": [ {...}, ... ]}
-    Each paper gets a "_score" and "why" (matched topic names).
-    """
+    """Fetch, score, and rank. Returns the payload the API serves."""
     pubmed_query = " OR ".join(
         f'"{t}"' for cfg in topics.values() for t in cfg["terms"])
 
-    # Fetch all three sources CONCURRENTLY instead of one-after-another.
-    # Each fetch is I/O-bound (it just waits on the network), so running them in
-    # separate threads means total time ≈ the slowest single source, not the sum
-    # of all three. ThreadPoolExecutor (Python stdlib) handles the threads for us:
-    # .submit() starts a task immediately and returns a "future"; .result() blocks
-    # until that task finishes and hands back its return value.
+    # The three fetches are I/O-bound, so run them concurrently — total latency
+    # is the slowest source, not the sum of all three.
     with ThreadPoolExecutor(max_workers=3) as pool:
-        f_biorxiv = pool.submit(fetch_biorxiv, days)
-        f_arxiv = pool.submit(fetch_arxiv, days)
-        f_pubmed = pool.submit(fetch_pubmed, days, pubmed_query)
-        papers = f_biorxiv.result() + f_arxiv.result() + f_pubmed.result()
+        futures = [
+            pool.submit(fetch_biorxiv, days),
+            pool.submit(fetch_arxiv, days),
+            pool.submit(fetch_pubmed, days, pubmed_query),
+        ]
+        papers = [p for f in futures for p in f.result()]
 
     papers = dedupe(papers)
+    today = dt.date.today()
 
+    ranked = []
     for p in papers:
-        body_score, hits = score(p["title"] + " " + p["abstract"], topics)
-        title_score, _ = score(p["title"], topics)  # title matches count double
-        p["score"] = body_score + title_score
+        # Title matches count double (titles are signal-dense).
+        rel, hits = score(p["title"] + " " + p["abstract"], topics)
+        rel += score(p["title"], topics)[0]
+        if rel <= 0:
+            continue
+        recency = _recency_factor(_parse_date(p["date"]), today)
+        p["score"] = rel
         p["why"] = hits
-        # trim abstract for transport
         p["abstract"] = p["abstract"][:600]
+        # Blend keyword relevance with freshness for the final ordering.
+        p["_rank"] = rel * (1 + RECENCY_WEIGHT * recency)
+        ranked.append(p)
 
-    ranked = sorted([p for p in papers if p["score"] > 0],
-                    key=lambda p: p["score"], reverse=True)[:top]
+    ranked.sort(key=lambda p: p["_rank"], reverse=True)
+    ranked = ranked[:top]
+    for p in ranked:
+        p.pop("_rank", None)
 
     return {
         "generated": dt.datetime.now().isoformat(timespec="seconds"),
