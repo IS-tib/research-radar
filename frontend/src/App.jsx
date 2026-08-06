@@ -8,6 +8,8 @@ const loadSaved = () => {
   try { return JSON.parse(localStorage.getItem(SAVED_KEY)) || [] } catch { return [] }
 }
 
+const pct = (x) => `${Math.round((x || 0) * 100)}%`
+
 export default function App() {
   const [papers, setPapers] = useState([])
   const [meta, setMeta] = useState(null)
@@ -22,6 +24,7 @@ export default function App() {
   const [saved, setSaved] = useState(loadSaved)
   const [view, setView] = useState('feed')        // 'feed' | 'saved'
   const [editing, setEditing] = useState(false)
+  const [insights, setInsights] = useState(false)
 
   async function runScan() {
     setLoading(true); setError(null)
@@ -100,6 +103,9 @@ export default function App() {
             <button className="primary" onClick={runScan} disabled={loading}>
               {loading ? 'Scanning…' : 'Refresh'}
             </button>
+            <button className="link" onClick={() => setInsights(!insights)}>
+              {insights ? 'Hide stats' : 'Insights'}
+            </button>
             <button className="link" onClick={() => setEditing(!editing)}>
               {editing ? 'Close' : 'Topics'}
             </button>
@@ -108,6 +114,7 @@ export default function App() {
       </div>
 
       {editing && view === 'feed' && <TopicsEditor onSaved={() => { setEditing(false); runScan() }} />}
+      {insights && view === 'feed' && shown.length > 0 && <Insights papers={shown} />}
 
       {view === 'feed' && meta && !loading &&
         <p className="status">{shown.length} shown · {meta.scanned} scanned · updated {meta.generated.slice(0, 16).replace('T', ' ')}</p>}
@@ -129,14 +136,24 @@ export default function App() {
 }
 
 function PaperCard({ p, rank, saved, onSave, showRank }) {
+  // Cards may carry a single `source` (older saves) or a merged `sources` union.
+  const sources = p.sources?.length ? p.sources : [p.source]
+  const c = p.components
+  const breakdown = c
+    ? `keyword ${pct(c.keyword)} · semantic ${pct(c.semantic)} · recency ${pct(c.recency)}`
+    : undefined
   return (
     <li className="entry">
       {showRank && <div className="num">{rank}</div>}
       <div className="col">
         <div className="line">
-          <span className={`tag src-${p.source.toLowerCase()}`}>{p.source}</span>
+          {sources.map((s) => (
+            <span key={s} className={`tag src-${s.toLowerCase()}`}>{s}</span>
+          ))}
           <span className="dot">·</span>
           <span>{p.date}</span>
+          {typeof p.match === 'number' &&
+            <span className="pct" title={breakdown}>{p.match}% match</span>}
           {p.why?.length > 0 && <span className="match">{p.why.join(', ')}</span>}
           <button className={`star ${saved ? 'on' : ''}`} onClick={onSave}
             title={saved ? 'Remove bookmark' : 'Save'}>{saved ? '★' : '☆'}</button>
@@ -146,6 +163,98 @@ function PaperCard({ p, rank, saved, onSave, showRank }) {
         <p className="excerpt">{p.abstract}{p.abstract?.length >= 600 ? '…' : ''}</p>
       </div>
     </li>
+  )
+}
+
+// Words that carry no topical signal — kept in sync in spirit with the backend's
+// stopword list so the client-side keyword bar surfaces real terms, not glue.
+const STOP = new Set(('the a an and or of to in for on with by is are was were be this '
+  + 'that from as at it its into via using used we our their they show shows study '
+  + 'studies results method methods based can new novel using single cell').split(' '))
+
+function Insights({ papers }) {
+  const stats = useMemo(() => {
+    const bySource = {}
+    const terms = {}
+    const byWeek = {}
+    for (const p of papers) {
+      for (const s of (p.sources?.length ? p.sources : [p.source])) {
+        bySource[s] = (bySource[s] || 0) + 1
+      }
+      for (const w of (p.title || '').toLowerCase().match(/[a-z][a-z0-9-]{2,}/g) || []) {
+        if (!STOP.has(w)) terms[w] = (terms[w] || 0) + 1
+      }
+      const wk = weekKey(p.date)
+      if (wk) byWeek[wk] = (byWeek[wk] || 0) + 1
+    }
+    const topTerms = Object.entries(terms)
+      .filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]).slice(0, 8)
+    const weeks = Object.keys(byWeek).sort().map((k) => ({ k, n: byWeek[k] }))
+    return { bySource, topTerms, weeks }
+  }, [papers])
+
+  const srcMax = Math.max(1, ...Object.values(stats.bySource))
+  const termMax = Math.max(1, ...stats.topTerms.map(([, n]) => n))
+
+  return (
+    <div className="insights">
+      <div className="ins-col">
+        <h4>By source</h4>
+        {SOURCES.filter((s) => stats.bySource[s]).map((s) => (
+          <div className="bar-row" key={s}>
+            <span className="bar-label">{s}</span>
+            <span className={`bar src-${s.toLowerCase()}`}
+              style={{ width: `${(stats.bySource[s] / srcMax) * 100}%` }} />
+            <span className="bar-n">{stats.bySource[s]}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="ins-col">
+        <h4>Top keywords</h4>
+        {stats.topTerms.length === 0 && <p className="ins-empty">Not enough data.</p>}
+        {stats.topTerms.map(([t, n]) => (
+          <div className="bar-row" key={t}>
+            <span className="bar-label">{t}</span>
+            <span className="bar accent" style={{ width: `${(n / termMax) * 100}%` }} />
+            <span className="bar-n">{n}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="ins-col">
+        <h4>Papers per week</h4>
+        <Sparkline weeks={stats.weeks} />
+      </div>
+    </div>
+  )
+}
+
+// ISO year-week bucket for a YYYY-MM-DD(-ish) date string; null if unparseable.
+function weekKey(date) {
+  const d = new Date((date || '').slice(0, 10))
+  if (isNaN(d)) return null
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+  const day = (t.getUTCDay() + 6) % 7            // Mon=0
+  t.setUTCDate(t.getUTCDate() - day + 3)         // nearest Thursday
+  const first = new Date(Date.UTC(t.getUTCFullYear(), 0, 4))
+  const week = 1 + Math.round(((t - first) / 864e5 - 3 + ((first.getUTCDay() + 6) % 7)) / 7)
+  return `${t.getUTCFullYear()}-${String(week).padStart(2, '0')}`
+}
+
+function Sparkline({ weeks }) {
+  if (weeks.length === 0) return <p className="ins-empty">No dated papers.</p>
+  const W = 168, H = 44, max = Math.max(...weeks.map((w) => w.n))
+  const step = weeks.length > 1 ? W / (weeks.length - 1) : 0
+  const pts = weeks.map((w, i) => [i * step, H - (w.n / max) * (H - 6) - 3])
+  const line = pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')
+  const area = `0,${H} ${line} ${W},${H}`
+  return (
+    <svg className="spark" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+      <polygon points={area} className="spark-fill" />
+      <polyline points={line} className="spark-line" />
+      {pts.map(([x, y], i) => <circle key={i} cx={x} cy={y} r="1.6" className="spark-dot" />)}
+    </svg>
   )
 }
 
