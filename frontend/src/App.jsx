@@ -15,6 +15,7 @@ export default function App() {
   const [meta, setMeta] = useState(null)
   const [days, setDays] = useState(7)
   const [top, setTop] = useState(25)
+  const [ranker, setRanker] = useState('tfidf')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
@@ -29,7 +30,7 @@ export default function App() {
   async function runScan() {
     setLoading(true); setError(null)
     try {
-      const data = await fetchPapers(days, top)
+      const data = await fetchPapers(days, top, ranker)
       setPapers(data.papers); setMeta(data)
     } catch (e) {
       setError(e.message)
@@ -100,6 +101,11 @@ export default function App() {
           <div className="scan">
             <label>days <input type="number" min="1" max="60" value={days}
               onChange={(e) => setDays(+e.target.value)} /></label>
+            <select value={ranker} onChange={(e) => setRanker(e.target.value)} title="Lexical ranking signal">
+              <option value="tfidf">TF-IDF</option>
+              <option value="bm25">BM25</option>
+              <option value="keyword">Keyword only</option>
+            </select>
             <button className="primary" onClick={runScan} disabled={loading}>
               {loading ? 'Scanning…' : 'Refresh'}
             </button>
@@ -140,7 +146,7 @@ function PaperCard({ p, rank, saved, onSave, showRank }) {
   const sources = p.sources?.length ? p.sources : [p.source]
   const c = p.components
   const breakdown = c
-    ? `keyword ${pct(c.keyword)} · semantic ${pct(c.semantic)} · recency ${pct(c.recency)}`
+    ? `${p.ranker || 'lexical'} ${pct(c.lexical)} · recency ${pct(c.recency)}`
     : undefined
   return (
     <li className="entry">

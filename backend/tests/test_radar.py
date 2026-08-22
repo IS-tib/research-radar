@@ -7,8 +7,6 @@ a paper is. Run them with:
     cd backend
     pip install pytest
     pytest
-
-A green test suite is what makes the CI badge on your README turn "passing".
 """
 
 import radar

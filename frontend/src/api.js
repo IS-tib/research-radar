@@ -8,7 +8,8 @@ async function json(path, opts) {
   return res.json()
 }
 
-export const fetchPapers = (days, top) => json(`/api/papers?days=${days}&top=${top}`)
+export const fetchPapers = (days, top, ranker = 'tfidf') =>
+  json(`/api/papers?days=${days}&top=${top}&ranker=${ranker}`)
 export const fetchTopics = () => json('/api/topics')
 export const saveTopics = (topics) =>
   json('/api/topics', {

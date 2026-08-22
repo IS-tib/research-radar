@@ -17,14 +17,26 @@ UA = {"User-Agent": "ResearchRadar/2.1"}
 # Papers newer than this get a relevance boost; older ones decay to none.
 RECENCY_HALFLIFE_DAYS = 14
 
-# The final ranking blends three transparent signals; the weights sum to 1 so the
-# blended value reads directly as a "match %". Keyword still leads (it's the most
-# precise), TF-IDF similarity catches on-topic work that happens to use different
-# vocabulary, and recency nudges fresh papers up.
-W_KEYWORD, W_SEMANTIC, W_RECENCY = 0.55, 0.30, 0.15
+# The final ranking blends one lexical signal with recency; the weights sum to 1
+# so the blended value reads directly as a "match %". The lexical signal itself is
+# pluggable (see RANKERS below) — recency stays a fixed, small nudge regardless of
+# which one is chosen.
+W_LEXICAL, W_RECENCY = 0.85, 0.15
 
-# A paper with no keyword hit is still surfaced if it sits close to the topics in
-# TF-IDF space — that semantic reach is the whole point of the layer.
+# Three ways to score a paper against the topic terms:
+#   "keyword" - exact weighted term hits (see score() below). Precise, but a
+#                paper that describes the same work in different words scores 0.
+#   "tfidf"   - cosine similarity in a TF-IDF vector space built over the fetched
+#                corpus. Catches paraphrases; the classic bag-of-words IR baseline.
+#   "bm25"    - Okapi BM25 over the same corpus. Also catches paraphrases, but
+#                saturates term frequency and normalizes for document length,
+#                which TF-IDF-cosine does only partially. See backend/eval for a
+#                measured comparison of the three on a fixed fixture set.
+RANKERS = ("keyword", "tfidf", "bm25")
+
+# A paper with no keyword hit is still surfaced if it sits close to the topics
+# under the chosen lexical ranker (tfidf/bm25) — that recall is the point of
+# using anything beyond exact keyword matching.
 SEMANTIC_KEEP = 0.10
 
 
@@ -154,6 +166,83 @@ def semantic_similarity(docs, topics):
     if not vocab:
         return [0.0] * len(docs)
     return _cosine(mat, query_vector(topics, vocab, idf)).tolist()
+
+
+# --- BM25 --------------------------------------------------------------------
+# Okapi BM25 is the standard lexical baseline in IR: like TF-IDF it scores a
+# document by the (idf-weighted) query terms it contains, but term frequency is
+# saturating (a term's 10th occurrence adds far less than its 1st) and document
+# length is normalized against the corpus average rather than folded into a
+# vector norm. Both properties make it behave better than raw TF-IDF cosine on
+# text of uneven length, which is exactly what a mixed bioRxiv/arXiv/PubMed
+# corpus is (abstracts range from one sentence to a full paragraph).
+
+BM25_K1 = 1.5   # term-frequency saturation: higher lets repeated terms count more
+BM25_B = 0.75   # length normalization strength: 0 = none, 1 = fully proportional
+
+
+def build_bm25(docs, k1=BM25_K1, b=BM25_B):
+    """Term frequencies, IDF, and length stats for `docs`, ready for scoring.
+
+    Returns (tf, vocab, idf, doc_lens, avgdl). `vocab` is sorted, exactly as in
+    build_tfidf, so scores are reproducible run to run. IDF uses the standard
+    Lucene/Elasticsearch smoothing, ln((N+1)/(df+0.5)), which unlike the textbook
+    BM25 IDF is never negative (a term appearing in most documents still
+    contributes a small positive weight instead of penalizing them)."""
+    tokenized = [_tokens(d) for d in docs]
+    vocab = {t: i for i, t in
+             enumerate(sorted({t for toks in tokenized for t in toks}))}
+    n, v = len(docs), len(vocab)
+    tf = np.zeros((n, v))
+    df = np.zeros(v)
+    doc_lens = np.array([len(toks) for toks in tokenized], dtype=float)
+    for i, toks in enumerate(tokenized):
+        seen = set()
+        for t in toks:
+            j = vocab[t]
+            tf[i, j] += 1.0
+            if j not in seen:
+                df[j] += 1.0
+                seen.add(j)
+    avgdl = doc_lens.mean() if n else 0.0
+    idf = np.log((n + 1) / (df + 0.5))
+    return tf, vocab, idf, doc_lens, avgdl
+
+
+def bm25_query_weights(topics, vocab):
+    """Fold topic terms into per-token query weights, mirroring query_vector()."""
+    q = np.zeros(len(vocab))
+    for cfg in topics.values():
+        w = cfg.get("weight", 1)
+        for term in cfg["terms"]:
+            for t in _tokens(term):
+                j = vocab.get(t)
+                if j is not None:
+                    q[j] += w
+    return q
+
+
+def bm25_scores(docs, topics, k1=BM25_K1, b=BM25_B):
+    """BM25 score of each document in `docs` against the topic query. Returns a
+    list aligned with `docs`, unbounded and non-negative (0 for a document that
+    shares no vocabulary with the query)."""
+    if not docs:
+        return []
+    tf, vocab, idf, doc_lens, avgdl = build_bm25(docs, k1, b)
+    n = tf.shape[0]
+    if not vocab or avgdl == 0:
+        return [0.0] * n
+    qw = bm25_query_weights(topics, vocab)
+    query_terms = np.nonzero(qw)[0]
+    if len(query_terms) == 0:
+        return [0.0] * n
+    len_norm = 1 - b + b * (doc_lens / avgdl)
+    scores = np.zeros(n)
+    for j in query_terms:
+        f = tf[:, j]
+        contrib = np.where(f > 0, idf[j] * f * (k1 + 1) / (f + k1 * len_norm), 0.0)
+        scores += qw[j] * contrib
+    return scores.tolist()
 
 
 # --- sources ---------------------------------------------------------------
@@ -301,7 +390,85 @@ def dedupe(papers):
     return records
 
 
-def scan(topics, days=7, top=20):
+def _lexical_signal(texts, topics, ranker):
+    """The chosen lexical ranker's score for each text, normalized to [0, 1]
+    within this batch. "keyword" is handled by the caller (it reuses the exact
+    same weighted-term score used for the "why" explanation), so this only
+    covers "tfidf" and "bm25"."""
+    if ranker == "tfidf":
+        return semantic_similarity(texts, topics)  # cosine is already in [0, 1]
+    if ranker == "bm25":
+        raw = bm25_scores(texts, topics)
+        peak = max(raw) if raw else 0.0
+        return [r / peak for r in raw] if peak else [0.0] * len(raw)
+    raise ValueError(f"unknown ranker {ranker!r}; choose from {RANKERS}")
+
+
+def rank(papers, topics, ranker="tfidf", include_recency=True):
+    """Score and order `papers` against `topics`. Pure function, no network I/O —
+    both the live API (via scan(), below) and the offline eval harness
+    (backend/eval/evaluate.py) call this, so eval numbers describe the actual
+    ranking code rather than a reimplementation of it.
+
+    `include_recency` defaults on for real use (fresher papers should edge out
+    stale ones with an equal lexical score). The eval harness turns it off,
+    because recency is a freshness heuristic, not a relevance judgment, and
+    leaving it on would make offline eval scores drift with wall-clock time on a
+    fixture set that has fixed dates.
+    """
+    if ranker not in RANKERS:
+        raise ValueError(f"unknown ranker {ranker!r}; choose from {RANKERS}")
+
+    today = dt.date.today()
+    texts = [f"{p.get('title', '')} {p.get('abstract', '')}" for p in papers]
+
+    # Build the lexical space once, over the whole corpus, so every paper is
+    # scored against the same vocabulary (both tfidf and bm25 are only
+    # comparable within a single space).
+    lex = None if ranker == "keyword" else _lexical_signal(texts, topics, ranker)
+
+    kept = []
+    for i, p in enumerate(papers):
+        # Title matches count double (titles are signal-dense).
+        rel, hits = score(p.get("title", "") + " " + p.get("abstract", ""), topics)
+        rel += score(p.get("title", ""), topics)[0]
+        sem = lex[i] if lex is not None else 0.0
+        if ranker == "keyword":
+            if rel <= 0:
+                continue
+        elif rel <= 0 and sem < SEMANTIC_KEEP:
+            continue
+        recency = _recency_factor(_parse_date(p.get("date")), today)
+        kept.append((p, rel, sem, recency, hits))
+
+    # Normalize keyword scores to [0,1] within this batch so keyword mode shares
+    # a scale with the already-bounded tfidf/bm25 signals.
+    max_rel = max((rel for _, rel, *_ in kept), default=0) or 1
+
+    ranked = []
+    for p, rel, sem, recency, hits in kept:
+        kw = rel / max_rel
+        lexical = kw if ranker == "keyword" else sem
+        blended = W_LEXICAL * lexical + W_RECENCY * recency if include_recency \
+            else lexical
+        out = dict(p)
+        out["score"] = round(blended, 4)
+        out["match"] = round(blended * 100)
+        # Exposed so the UI can explain *why* a paper ranked where it did.
+        out["components"] = {
+            "lexical": round(lexical, 3),
+            "recency": round(recency, 3),
+        }
+        out["ranker"] = ranker
+        out["why"] = hits
+        out["abstract"] = (out.get("abstract") or "")[:600]
+        ranked.append(out)
+
+    ranked.sort(key=lambda p: p["score"], reverse=True)
+    return ranked
+
+
+def scan(topics, days=7, top=20, ranker="tfidf"):
     """Fetch, score, and rank. Returns the payload the API serves."""
     pubmed_query = " OR ".join(
         f'"{t}"' for cfg in topics.values() for t in cfg["terms"])
@@ -317,50 +484,12 @@ def scan(topics, days=7, top=20):
         papers = [p for f in futures for p in f.result()]
 
     papers = dedupe(papers)
-    today = dt.date.today()
-
-    # Build the TF-IDF space once, over the whole fetched corpus, so every paper is
-    # scored against the same vocabulary (cosine is only meaningful within one space).
-    sims = semantic_similarity(
-        [f"{p['title']} {p['abstract']}" for p in papers], topics)
-
-    kept = []
-    for i, p in enumerate(papers):
-        # Title matches count double (titles are signal-dense).
-        rel, hits = score(p["title"] + " " + p["abstract"], topics)
-        rel += score(p["title"], topics)[0]
-        sem = sims[i] if i < len(sims) else 0.0
-        if rel <= 0 and sem < SEMANTIC_KEEP:
-            continue
-        recency = _recency_factor(_parse_date(p["date"]), today)
-        kept.append((p, rel, sem, recency, hits))
-
-    # Normalize keyword scores to [0,1] within this batch so all three components
-    # share a scale before blending into a single, human-readable match percentage.
-    max_rel = max((rel for _, rel, *_ in kept), default=0) or 1
-
-    ranked = []
-    for p, rel, sem, recency, hits in kept:
-        kw = rel / max_rel
-        blended = W_KEYWORD * kw + W_SEMANTIC * sem + W_RECENCY * recency
-        p["score"] = round(blended, 4)
-        p["match"] = round(blended * 100)
-        # Exposed so the UI can explain *why* a paper ranked where it did.
-        p["components"] = {
-            "keyword": round(kw, 3),
-            "semantic": round(sem, 3),
-            "recency": round(recency, 3),
-        }
-        p["why"] = hits
-        p["abstract"] = p["abstract"][:600]
-        ranked.append(p)
-
-    ranked.sort(key=lambda p: p["score"], reverse=True)
-    ranked = ranked[:top]
+    ranked = rank(papers, topics, ranker=ranker)[:top]
 
     return {
         "generated": dt.datetime.now().isoformat(timespec="seconds"),
         "days": days,
+        "ranker": ranker,
         "count": len(ranked),
         "scanned": len(papers),
         "papers": ranked,
