@@ -1,8 +1,6 @@
-# GitHub Actions CI — runs automatically on every push.
-# It installs the backend, runs the tests, and builds the frontend.
-# When it passes, GitHub shows a green check on your commits and you can add a
-# "build: passing" badge to your README. This is a real, recruiter-visible
-# signal that your project actually works.
+# Runs on every push and pull request: installs the backend, runs the pytest
+# suite (parsers, rankers, ranking metrics and the cache), and builds the
+# frontend so a broken build is caught before it is deployed.
 name: CI
 
 on:
